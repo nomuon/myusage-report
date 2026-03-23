@@ -1,0 +1,15 @@
+# Generated reports
+report.html
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local files
+CLAUDE.local.md
+.claude/settings.local.json
