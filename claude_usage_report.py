@@ -16,30 +16,94 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict, Counter
 
 # ─────────────────────────────────────────────
-# コスト計算用料金レート (USD / 1M tokens)
+# タイムゾーン
 # ─────────────────────────────────────────────
 
-MODEL_PRICING = {
-    "claude-opus-4": {
-        "input": 15.0, "output": 75.0,
-        "cache_create_mul": 1.25, "cache_read_mul": 0.10,
-    },
-    "claude-sonnet-4": {
-        "input": 3.0, "output": 15.0,
-        "cache_create_mul": 1.25, "cache_read_mul": 0.10,
-    },
-    "claude-haiku-4": {
-        "input": 0.80, "output": 4.0,
-        "cache_create_mul": 1.25, "cache_read_mul": 0.10,
-    },
-}
-DEFAULT_PRICING = MODEL_PRICING["claude-sonnet-4"]
+JST = timezone(timedelta(hours=9), "JST")
 
-def get_model_pricing(model_name: str) -> dict:
-    for key, pricing in MODEL_PRICING.items():
-        if key in model_name:
-            return pricing
-    return DEFAULT_PRICING
+# ─────────────────────────────────────────────
+# コスト計算用料金レート (USD / 1M tokens)
+# 出典: https://platform.claude.com/docs/en/about-claude/pricing (2026-11-01 確認)
+# ─────────────────────────────────────────────
+
+def _rates(input_price: float, output_price: float, cache_read: float) -> dict:
+    # キャッシュ書き込みは全モデル共通で 5分 TTL=入力の1.25倍 / 1時間 TTL=2倍。
+    # キャッシュ読み取りの倍率はモデルごとに異なるため実額で持つ。
+    return {
+        "input": input_price, "output": output_price,
+        "cache_5m": input_price * 1.25, "cache_1h": input_price * 2,
+        "cache_read": cache_read,
+    }
+
+MODEL_PRICING = {
+    "claude-fable-5-1": _rates(10, 50, 0.25),
+    "claude-mythos-5-1": _rates(10, 50, 0.25),
+    "claude-fable-5": _rates(10, 50, 1.0),
+    "claude-mythos-5": _rates(10, 50, 1.0),
+    "claude-opus-5-5": _rates(4, 20, 0.20),
+    "claude-opus-5": _rates(5, 25, 0.50),
+    "claude-opus-4-8": _rates(5, 25, 0.50),
+    "claude-opus-4-7": _rates(5, 25, 0.50),
+    "claude-opus-4-6": _rates(5, 25, 0.50),
+    "claude-opus-4-5": _rates(5, 25, 0.50),
+    "claude-opus-4-1": _rates(15, 75, 1.50),
+    "claude-opus-4": _rates(15, 75, 1.50),
+    "claude-sonnet-5-5": _rates(2, 10, 0.10),
+    "claude-sonnet-5": _rates(2, 10, 0.20),
+    "claude-sonnet-4-6": _rates(3, 15, 0.30),
+    "claude-sonnet-4-5": _rates(3, 15, 0.30),
+    "claude-sonnet-4": _rates(3, 15, 0.30),
+    "claude-haiku-5-5": _rates(0.10, 0.50, 0.01),
+    "claude-haiku-4-5": _rates(1, 5, 0.10),
+    "claude-3-5-haiku": _rates(0.80, 4, 0.08),
+}
+# 未知のモデルの仮単価。使われたら parse_projects が警告を出す
+DEFAULT_PRICING = MODEL_PRICING["claude-sonnet-5-5"]
+
+# Haiku 5.5 はプロンプト長 (入力+キャッシュ読み書き) が閾値を超えるリクエストだけ高い単価になる
+HAIKU_55_LONG_PRICING = _rates(0.50, 2.50, 0.05)
+HAIKU_55_LONG_THRESHOLD = 100_000
+
+# Fast mode の単価倍率 (usage.speed == "fast")
+FAST_MODE_MULTIPLIER = {
+    "claude-opus-5-5": 2.0,
+    "claude-opus-5": 2.0,
+    "claude-opus-4-8": 2.0,
+}
+
+def normalize_model(model_name: str) -> str:
+    """Bedrock 接頭辞・バージョン・[1m]・日付を除いた素のモデル ID を返す"""
+    name = re.sub(r"\[[^\]]*\]$", "", model_name)
+    name = re.sub(r"^.*anthropic\.", "", name)
+    name = re.sub(r"-v\d+(:\d+)?$", "", name)
+    return re.sub(r"[-@]\d{8}$", "", name)
+
+def get_model_pricing(model_name: str, prompt_tokens: int = 0) -> dict:
+    key = normalize_model(model_name)
+    if key == "claude-haiku-5-5" and prompt_tokens > HAIKU_55_LONG_THRESHOLD:
+        return HAIKU_55_LONG_PRICING
+    return MODEL_PRICING.get(key, DEFAULT_PRICING)
+
+def estimate_cost(td: dict) -> tuple:
+    """1リクエストの (推定コスト, キャッシュなしだった場合のコスト) を USD で返す"""
+    prompt_tokens = td["input"] + td["cache_create"] + td["cache_read"]
+    pricing = get_model_pricing(td["model"], prompt_tokens)
+    mul = 1.0
+    if td.get("speed") == "fast":
+        mul = FAST_MODE_MULTIPLIER.get(normalize_model(td["model"]), 1.0)
+
+    cache_1h = min(td.get("cache_1h", 0), td["cache_create"])
+    cache_5m = td["cache_create"] - cache_1h
+    output_cost = td["output"] * pricing["output"]
+    cost = (
+        td["input"] * pricing["input"]
+        + output_cost
+        + cache_5m * pricing["cache_5m"]
+        + cache_1h * pricing["cache_1h"]
+        + td["cache_read"] * pricing["cache_read"]
+    )
+    no_cache_cost = prompt_tokens * pricing["input"] + output_cost
+    return cost * mul / 1_000_000, no_cache_cost * mul / 1_000_000
 
 def format_tokens(n: int) -> str:
     if n >= 1_000_000_000:
@@ -118,6 +182,7 @@ def parse_projects(claude_dir: Path, days: int = 0):
         return []
 
     sessions = []
+    unknown_model_tokens = Counter()
     cutoff = None
     if days > 0:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -155,7 +220,7 @@ def parse_projects(claude_dir: Path, days: int = 0):
                         ts = None
                         if ts_str:
                             try:
-                                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone(JST)
                             except ValueError:
                                 pass
 
@@ -183,12 +248,16 @@ def parse_projects(claude_dir: Path, days: int = 0):
                                         "model": model or "",
                                         "input": 0, "output": 0,
                                         "cache_create": 0, "cache_read": 0,
+                                        "cache_1h": 0, "speed": None,
                                     }
                                 td = token_data[msg_id]
                                 td["input"] = max(td["input"], usage.get("input_tokens", 0))
                                 td["output"] = max(td["output"], usage.get("output_tokens", 0))
                                 td["cache_create"] = max(td["cache_create"], usage.get("cache_creation_input_tokens", 0))
                                 td["cache_read"] = max(td["cache_read"], usage.get("cache_read_input_tokens", 0))
+                                cache_detail = usage.get("cache_creation") or {}
+                                td["cache_1h"] = max(td["cache_1h"], cache_detail.get("ephemeral_1h_input_tokens") or 0)
+                                td["speed"] = usage.get("speed") or td["speed"]
                                 if model:
                                     td["model"] = model
 
@@ -236,27 +305,14 @@ def parse_projects(claude_dir: Path, days: int = 0):
             cost_without_cache = 0.0
             model_costs = defaultdict(float)
             for td in token_data.values():
-                pricing = get_model_pricing(td["model"]) if td["model"] else DEFAULT_PRICING
-                input_rate = pricing["input"] / 1_000_000
-                output_rate = pricing["output"] / 1_000_000
-                cache_create_rate = input_rate * pricing["cache_create_mul"]
-                cache_read_rate = input_rate * pricing["cache_read_mul"]
-
-                cost = (
-                    td["input"] * input_rate
-                    + td["output"] * output_rate
-                    + td["cache_create"] * cache_create_rate
-                    + td["cache_read"] * cache_read_rate
-                )
+                cost, no_cache_cost = estimate_cost(td)
                 session_cost += cost
-
-                no_cache_cost = (
-                    (td["input"] + td["cache_create"] + td["cache_read"]) * input_rate
-                    + td["output"] * output_rate
-                )
                 cost_without_cache += no_cache_cost
 
-                short_model = re.sub(r"-\d{8}$", "", td["model"]) if td["model"] else "(unknown)"
+                short_model = normalize_model(td["model"]) if td["model"] else "(unknown)"
+                billable_tokens = td["input"] + td["output"] + td["cache_create"] + td["cache_read"]
+                if short_model not in MODEL_PRICING and billable_tokens > 0:
+                    unknown_model_tokens[short_model] += billable_tokens
                 model_costs[short_model] += cost
 
             sessions.append({
@@ -285,6 +341,13 @@ def parse_projects(claude_dir: Path, days: int = 0):
                 "tool_uses": dict(tool_uses),
             })
 
+    for model, tokens in unknown_model_tokens.most_common():
+        print(
+            f"⚠️  単価未登録のモデル: {model} ({format_tokens(tokens)} tokens)。"
+            "仮単価で推定しているので MODEL_PRICING に追加してください。",
+            file=sys.stderr,
+        )
+
     return sorted(sessions, key=lambda s: s["first_ts"] or datetime.min.replace(tzinfo=timezone.utc))
 
 def compute_stats(sessions):
@@ -309,7 +372,7 @@ def compute_stats(sessions):
 
     # daily activity (last 90 days)
     daily_counts = Counter(ts.date() for ts in all_ts)
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(JST).date()
     start_day = today - timedelta(days=89)
     daily_labels = []
     daily_values = []
@@ -323,8 +386,7 @@ def compute_stats(sessions):
     model_counts = Counter()
     for s in sessions:
         for m in s["models"]:
-            short = re.sub(r"-\d{8}$", "", m)  # remove date suffix
-            model_counts[short] += 1
+            model_counts[normalize_model(m)] += 1
     if not model_counts:
         model_counts["(不明)"] = len(sessions)
 
@@ -345,7 +407,7 @@ def compute_stats(sessions):
     for ts in all_ts:
         iso_week = ts.isocalendar()
         week_counts[(iso_week[0], iso_week[1])] += 1
-    today_dt = datetime.now(timezone.utc)
+    today_dt = datetime.now(JST)
     weekly_labels = []
     weekly_values = []
     for i in range(11, -1, -1):
@@ -1510,7 +1572,7 @@ def main():
         print(json.dumps(stats, ensure_ascii=False, default=str, indent=2))
         return
 
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    generated_at = datetime.now(JST).strftime("%Y-%m-%d %H:%M:%S JST")
     html = build_html(stats, generated_at)
 
     output_path = Path(args.output)
