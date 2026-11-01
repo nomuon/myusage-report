@@ -2,7 +2,7 @@
 """
 claude_usage_report.py
 Claude Code ローカル使用状況レポート生成ツール
-外部API・ネットワーク通信なし / 完全ローカル処理
+会話履歴の解析はローカルのみ。既定の出力は共有前提で匿名化する
 """
 
 import json
@@ -14,6 +14,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, Counter
+from html import escape
 
 # ─────────────────────────────────────────────
 # タイムゾーン
@@ -105,6 +106,43 @@ def estimate_cost(td: dict) -> tuple:
     no_cache_cost = prompt_tokens * pricing["input"] + output_cost
     return cost * mul / 1_000_000, no_cache_cost * mul / 1_000_000
 
+# ─────────────────────────────────────────────
+# 共有用の匿名化
+# 既定では、固定の語彙に載っている名前だけをレポートへ出す
+# ─────────────────────────────────────────────
+
+BUILTIN_TOOLS = {
+    "Agent", "AskUserQuestion", "Bash", "BashOutput", "Edit", "EnterPlanMode",
+    "EnterWorktree", "ExitPlanMode", "ExitWorktree", "Glob", "Grep", "KillShell",
+    "ListAgents", "LS", "Monitor", "MultiEdit", "NotebookEdit", "Read",
+    "ScheduleWakeup", "SendMessage", "Skill", "StructuredOutput", "Task",
+    "TaskStop", "TodoWrite", "ToolSearch", "WebFetch", "WebSearch", "Workflow",
+    "Write",
+}
+OTHER_MODEL_LABEL = "その他モデル"
+
+def public_tool_name(name: str) -> str:
+    if name in BUILTIN_TOOLS:
+        return name
+    # MCP のサーバー名には組織名やサービス名が含まれるため個別に出さない
+    return "MCP ツール" if name.startswith("mcp__") else "その他ツール"
+
+def public_model_name(name: str) -> str:
+    return name if name in MODEL_PRICING else OTHER_MODEL_LABEL
+
+def local_project_name(dir_name: str) -> str:
+    """プロジェクトディレクトリ名からホームディレクトリ部分を除く"""
+    home = re.sub(r"[^A-Za-z0-9]", "-", str(Path.home()))
+    if dir_name == home:
+        return "~"
+    if dir_name.startswith(home + "-"):
+        return dir_name[len(home) + 1:]
+    return re.sub(r"^-(?:Users|home)-[^-]+-", "", dir_name)
+
+def display_path(path) -> str:
+    """ターミナル出力でホームディレクトリを ~ に置き換える"""
+    return str(path).replace(str(Path.home()), "~", 1)
+
 def format_tokens(n: int) -> str:
     if n >= 1_000_000_000:
         return f"{n / 1_000_000_000:.1f}B"
@@ -190,12 +228,7 @@ def parse_projects(claude_dir: Path, days: int = 0):
     for project_dir in sorted(projects_dir.iterdir()):
         if not project_dir.is_dir():
             continue
-        project_name = project_dir.name
-        # decode URL-encoded path
-        try:
-            decoded = project_name.replace("-", "/")
-        except Exception:
-            decoded = project_name
+        project_name = local_project_name(project_dir.name)
 
         for jsonl_file in sorted(project_dir.glob("*.jsonl")):
             messages = []
@@ -205,73 +238,80 @@ def parse_projects(claude_dir: Path, days: int = 0):
             token_data = {}
             tool_uses = Counter()
 
-            try:
-                with open(jsonl_file, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+            # サブエージェントのログは親セッションに合算する。
+            # トークン・コスト・ツール・モデルだけを集計し、メッセージ数や所要時間には含めない
+            subagent_dir = project_dir / jsonl_file.stem / "subagents"
+            log_files = [jsonl_file] + sorted(subagent_dir.rglob("*.jsonl"))
 
-                        ts_str = entry.get("timestamp")
-                        ts = None
-                        if ts_str:
+            for log_file in log_files:
+                is_subagent = log_file != jsonl_file
+                try:
+                    with open(log_file, encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
                             try:
-                                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone(JST)
-                            except ValueError:
-                                pass
+                                entry = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
 
-                        if ts:
-                            if first_ts is None or ts < first_ts:
-                                first_ts = ts
-                            if last_ts is None or ts > last_ts:
-                                last_ts = ts
+                            ts_str = entry.get("timestamp")
+                            ts = None
+                            if ts_str:
+                                try:
+                                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).astimezone(JST)
+                                except ValueError:
+                                    pass
 
-                        msg = entry.get("message", {})
-                        role = msg.get("role") if msg else entry.get("type")
-                        content = msg.get("content", "") if msg else ""
-                        model = msg.get("model", "") if msg else ""
+                            if ts and not is_subagent:
+                                if first_ts is None or ts < first_ts:
+                                    first_ts = ts
+                                if last_ts is None or ts > last_ts:
+                                    last_ts = ts
 
-                        if model:
-                            models_seen.add(model)
+                            msg = entry.get("message", {})
+                            role = msg.get("role") if msg else entry.get("type")
+                            content = msg.get("content", "") if msg else ""
+                            model = msg.get("model", "") if msg else ""
 
-                        # token usage extraction (deduplicate by message id)
-                        if msg:
-                            msg_id = msg.get("id", "")
-                            usage = msg.get("usage", {})
-                            if msg_id and usage:
-                                if msg_id not in token_data:
-                                    token_data[msg_id] = {
-                                        "model": model or "",
-                                        "input": 0, "output": 0,
-                                        "cache_create": 0, "cache_read": 0,
-                                        "cache_1h": 0, "speed": None,
-                                    }
-                                td = token_data[msg_id]
-                                td["input"] = max(td["input"], usage.get("input_tokens", 0))
-                                td["output"] = max(td["output"], usage.get("output_tokens", 0))
-                                td["cache_create"] = max(td["cache_create"], usage.get("cache_creation_input_tokens", 0))
-                                td["cache_read"] = max(td["cache_read"], usage.get("cache_read_input_tokens", 0))
-                                cache_detail = usage.get("cache_creation") or {}
-                                td["cache_1h"] = max(td["cache_1h"], cache_detail.get("ephemeral_1h_input_tokens") or 0)
-                                td["speed"] = usage.get("speed") or td["speed"]
-                                if model:
-                                    td["model"] = model
+                            if model:
+                                models_seen.add(model)
 
-                        # tool_use extraction
-                        if isinstance(content, list):
-                            for block in content:
-                                if isinstance(block, dict) and block.get("type") == "tool_use":
-                                    tool_uses[block.get("name", "unknown")] += 1
+                            # token usage extraction (deduplicate by message id)
+                            if msg:
+                                msg_id = msg.get("id", "")
+                                usage = msg.get("usage", {})
+                                if msg_id and usage:
+                                    if msg_id not in token_data:
+                                        token_data[msg_id] = {
+                                            "model": model or "",
+                                            "input": 0, "output": 0,
+                                            "cache_create": 0, "cache_read": 0,
+                                            "cache_1h": 0, "speed": None,
+                                        }
+                                    td = token_data[msg_id]
+                                    td["input"] = max(td["input"], usage.get("input_tokens", 0))
+                                    td["output"] = max(td["output"], usage.get("output_tokens", 0))
+                                    td["cache_create"] = max(td["cache_create"], usage.get("cache_creation_input_tokens", 0))
+                                    td["cache_read"] = max(td["cache_read"], usage.get("cache_read_input_tokens", 0))
+                                    cache_detail = usage.get("cache_creation") or {}
+                                    td["cache_1h"] = max(td["cache_1h"], cache_detail.get("ephemeral_1h_input_tokens") or 0)
+                                    td["speed"] = usage.get("speed") or td["speed"]
+                                    if model:
+                                        td["model"] = model
 
-                        if role in ("user", "assistant"):
-                            messages.append({"role": role, "content": content, "ts": ts})
+                            # tool_use extraction
+                            if isinstance(content, list):
+                                for block in content:
+                                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                                        tool_uses[block.get("name", "unknown")] += 1
 
-            except (IOError, OSError):
-                continue
+                            if role in ("user", "assistant") and not is_subagent:
+                                messages.append({"role": role, "content": content, "ts": ts})
+
+                except (OSError, UnicodeDecodeError):
+                    continue
 
             if not messages:
                 continue
@@ -316,7 +356,7 @@ def parse_projects(claude_dir: Path, days: int = 0):
                 model_costs[short_model] += cost
 
             sessions.append({
-                "project": decoded,
+                "project": project_name,
                 "file": jsonl_file.name,
                 "first_ts": first_ts,
                 "last_ts": last_ts,
@@ -350,7 +390,7 @@ def parse_projects(claude_dir: Path, days: int = 0):
 
     return sorted(sessions, key=lambda s: s["first_ts"] or datetime.min.replace(tzinfo=timezone.utc))
 
-def compute_stats(sessions):
+def compute_stats(sessions, show_names: bool = False):
     if not sessions:
         return {}
 
@@ -386,7 +426,8 @@ def compute_stats(sessions):
     model_counts = Counter()
     for s in sessions:
         for m in s["models"]:
-            model_counts[normalize_model(m)] += 1
+            short = normalize_model(m)
+            model_counts[short if show_names else public_model_name(short)] += 1
     if not model_counts:
         model_counts["(不明)"] = len(sessions)
 
@@ -400,7 +441,12 @@ def compute_stats(sessions):
 
     # top projects
     proj_counts = Counter(s["project"] for s in sessions)
-    top_projects = proj_counts.most_common(10)
+    # 匿名ラベルは名前から導出せず順位で振る (ハッシュだと名前を総当たりで特定できる)
+    project_labels = {
+        p: p if show_names else f"Project {i}"
+        for i, (p, _) in enumerate(proj_counts.most_common(), 1)
+    }
+    top_projects = [(project_labels[p], c) for p, c in proj_counts.most_common(10)]
 
     # weekly trend (last 12 weeks)
     week_counts = Counter()
@@ -482,7 +528,7 @@ def compute_stats(sessions):
     model_cost_map = defaultdict(float)
     for s in sessions:
         for m, c in s["model_costs"].items():
-            model_cost_map[m] += c
+            model_cost_map[m if show_names else public_model_name(m)] += c
     model_cost_sorted = sorted(model_cost_map.items(), key=lambda x: x[1], reverse=True)
     model_cost_labels = [m for m, _ in model_cost_sorted[:8]]
     model_cost_values = [round(c, 2) for _, c in model_cost_sorted[:8]]
@@ -490,14 +536,14 @@ def compute_stats(sessions):
     # project cost
     proj_cost_map = defaultdict(float)
     for s in sessions:
-        proj_cost_map[s["project"]] += s["estimated_cost"]
+        proj_cost_map[project_labels[s["project"]]] += s["estimated_cost"]
     top_projects_cost = sorted(proj_cost_map.items(), key=lambda x: x[1], reverse=True)[:10]
 
     # tool usage
     total_tool_counter = Counter()
     for s in sessions:
         for tool, count in s["tool_uses"].items():
-            total_tool_counter[tool] += count
+            total_tool_counter[tool if show_names else public_tool_name(tool)] += count
     tool_top = total_tool_counter.most_common(15)
     tool_labels = [t for t, _ in tool_top]
     tool_values = [c for _, c in tool_top]
@@ -575,7 +621,8 @@ def compute_stats(sessions):
 CHARTJS_CDN = "https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"
 
 def j(v):
-    return json.dumps(v, ensure_ascii=False)
+    # <script> 内に埋め込むため、文字列で </script> が閉じないようにする
+    return json.dumps(v, ensure_ascii=False).replace("</", "<\\/")
 
 def build_html(stats: dict, generated_at: str) -> str:
     s = stats
@@ -603,7 +650,7 @@ def build_html(stats: dict, generated_at: str) -> str:
 
     top_proj_rows = "".join(
         f"""<tr>
-          <td class="proj-name">{p}</td>
+          <td class="proj-name">{escape(p)}</td>
           <td class="proj-bar-cell">
             <div class="proj-bar-wrap">
               <div class="proj-bar" style="width:{round(c/s['top_projects'][0][1]*100)}%"></div>
@@ -614,10 +661,10 @@ def build_html(stats: dict, generated_at: str) -> str:
         for p, c in s["top_projects"]
     )
 
-    max_proj_cost = s["top_projects_cost"][0][1] if s.get("top_projects_cost") else 1
+    max_proj_cost = (s["top_projects_cost"][0][1] if s.get("top_projects_cost") else 0) or 1
     top_proj_cost_rows = "".join(
         f"""<tr>
-          <td class="proj-name">{p}</td>
+          <td class="proj-name">{escape(p)}</td>
           <td class="proj-bar-cell">
             <div class="proj-bar-wrap">
               <div class="proj-bar" style="width:{round(c/max_proj_cost*100)}%;background:linear-gradient(90deg,{ACCENT5},rgba(239,68,68,0.5))"></div>
@@ -635,7 +682,6 @@ def build_html(stats: dict, generated_at: str) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Claude Code Usage Report</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap');
 
   *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 
@@ -1550,15 +1596,19 @@ def main():
         "--extract-only", action="store_true",
         help="データ抽出のみ（JSON出力）"
     )
+    parser.add_argument(
+        "--show-names", action="store_true",
+        help="プロジェクト名・MCP・未登録モデルを実名で出力（自分用。共有しないこと）"
+    )
     args = parser.parse_args()
 
     claude_dir = Path(args.claude_dir)
     if not claude_dir.exists():
-        print(f"❌ Claude ディレクトリが見つかりません: {claude_dir}", file=sys.stderr)
+        print(f"❌ Claude ディレクトリが見つかりません: {display_path(claude_dir)}", file=sys.stderr)
         print("   Claude Code をインストール・起動して、会話履歴を作成してください。", file=sys.stderr)
         sys.exit(1)
 
-    print(f"📂 読み取り中: {claude_dir}/projects/ ...", file=sys.stderr)
+    print(f"📂 読み取り中: {display_path(claude_dir)}/projects/ ...", file=sys.stderr)
     sessions = parse_projects(claude_dir, args.days)
 
     if not sessions:
@@ -1566,7 +1616,9 @@ def main():
         sys.exit(1)
 
     print(f"✅ {len(sessions)} セッションを検出", file=sys.stderr)
-    stats = compute_stats(sessions)
+    stats = compute_stats(sessions, args.show_names)
+    if args.show_names:
+        print("⚠️  --show-names: 実名を含みます。この出力は共有しないでください。", file=sys.stderr)
 
     if args.extract_only:
         print(json.dumps(stats, ensure_ascii=False, default=str, indent=2))
@@ -1579,8 +1631,8 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html, encoding="utf-8")
 
-    print(f"🎉 レポート生成完了: {output_path}", file=sys.stderr)
-    print(f"   open {output_path}", file=sys.stderr)
+    print(f"🎉 レポート生成完了: {display_path(output_path)}", file=sys.stderr)
+    print(f"   open {display_path(output_path)}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

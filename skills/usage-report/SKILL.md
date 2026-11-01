@@ -3,13 +3,13 @@ name: usage-report
 description: Claude Code の使用状況レポートを生成。"usage report", "使用状況レポート", "Claude利用分析", "レポート生成" で呼び出し
 disable-model-invocation: true
 allowed-tools: Bash(python3 *)
-argument-hint: "[--days N] [--output path] [--extract-only]"
+argument-hint: "[--days N] [--output path] [--extract-only] [--show-names]"
 ---
 
 # Claude Code Usage Report Generator
 
 Claude Code のローカル会話履歴を解析し、使用状況をビジュアルな HTML レポートとして生成する。
-外部 API・ネットワーク通信なし、完全ローカル処理。
+会話履歴の解析はローカルのみ（送信なし）。既定の出力は共有前提で匿名化される。
 
 ## 実行
 
@@ -27,6 +27,7 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/claude_usage_report.py $ARGUMENTS
 | `--output PATH` | 出力ファイルパス | ./report.html |
 | `--claude-dir PATH` | Claude設定ディレクトリ | ~/.claude |
 | `--extract-only` | データ抽出のみ(JSON出力) | - |
+| `--show-names` | プロジェクト名・MCP・未登録モデルを実名で出力(自分用。共有しないこと) | - |
 
 ## 実行例
 
