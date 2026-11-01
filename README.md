@@ -27,8 +27,8 @@ Claude Code のローカル会話履歴（`~/.claude/projects/` 内の JSONL フ
 ### CLI として使う
 
 ```bash
-git clone https://github.com/nomuon/claude-usage-report.git
-cd claude-usage-report
+git clone https://github.com/nomuon/myusage-report.git
+cd myusage-report
 python3 claude_usage_report.py
 ```
 
@@ -37,7 +37,7 @@ python3 claude_usage_report.py
 1. リポジトリをクローン:
 
 ```bash
-git clone https://github.com/nomuon/claude-usage-report.git
+git clone https://github.com/nomuon/myusage-report.git
 ```
 
 2. スキルディレクトリにシンボリックリンクを作成:
@@ -112,7 +112,7 @@ python3 claude_usage_report.py --extract-only
 ## ディレクトリ構成
 
 ```
-claude-usage-report/
+myusage-report/
 ├── claude_usage_report.py          # メインスクリプト
 ├── skills/
 │   └── usage-report/
